@@ -206,6 +206,16 @@ struct AlgoConstants {
     container_size: Size<f32>,
     /// The size of the internal container
     inner_container_size: Size<f32>,
+
+    /// The container's intrinsic cross size, per
+    /// [§9.9.2](https://www.w3.org/TR/css-flexbox-1/#intrinsic-cross-sizes): the sum over flex
+    /// lines of each line's largest cross-axis item contribution, plus cross-axis gaps.
+    ///
+    /// Computed *before* flexible lengths are resolved, and only for a column container with an
+    /// indefinite cross size — see `determine_intrinsic_cross_size`. `None` in every other case,
+    /// in which case the container's cross size falls back to the sum of the flex lines' cross
+    /// sizes as before.
+    intrinsic_cross_size: Option<f32>,
 }
 
 impl AlgoConstants {
@@ -404,6 +414,14 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
             .unwrap_or(0.0);
         constants.gap.set_main(constants.dir, new_gap);
     }
+
+    // Determine the container's intrinsic cross size (§9.9.2). This must happen here, before
+    // flexible lengths are resolved, because it is defined in terms of the items' *pre-flex*
+    // contributions. It is consumed by `determine_container_cross_size` at step 15.
+    debug_log!("determine_intrinsic_cross_size");
+    constants.intrinsic_cross_size =
+        determine_intrinsic_cross_size(tree, known_dimensions, available_space, &flex_lines, &constants);
+    debug_log!("constants.intrinsic_cross_size", dbg:constants.intrinsic_cross_size);
 
     // 6. Resolve the flexible lengths of all the flex items to find their used main size.
     debug_log!("resolve_flexible_lengths");
@@ -635,6 +653,7 @@ fn compute_constants(
         cross_axis_available_space_is_definite,
         container_size,
         inner_container_size,
+        intrinsic_cross_size: None,
     }
 }
 
@@ -1283,6 +1302,159 @@ fn item_known_dimension_definiteness(constants: &AlgoConstants, item: &FlexItem)
         || (!dir.is_row() && constants.cross_axis_available_space_is_definite);
 
     Size { width: true, height: true }.with_main(dir, main_is_definite).with_cross(dir, cross_is_definite)
+}
+
+/// Determine the container's intrinsic cross size.
+///
+/// # [9.9.2. Flex Container Intrinsic Cross Sizes](https://www.w3.org/TR/css-flexbox-1/#intrinsic-cross-sizes)
+///
+/// > The min-content/max-content cross size of a single-line flex container is the largest
+/// > min-content contribution/max-content contribution (respectively) of its flex items.
+///
+/// A *contribution* is computed before flexible lengths are resolved, so this pass runs between
+/// step 5 (collect flex lines) and step 6 (resolve flexible lengths), using each item's flex base
+/// size as its main size. By step 15 the item main sizes have been flexed and the pre-flex answer
+/// is no longer recoverable, which is why this cannot live in `determine_container_cross_size`.
+///
+/// For a multi-line container the lines sit side by side along the cross axis, so the container's
+/// cross size is the *sum* over lines of each line's largest contribution, plus the cross-axis
+/// gaps — not the largest contribution overall.
+///
+/// # Why this applies to column containers only
+///
+/// For a **column** container the cross axis is the inline axis. An inline size must be resolved
+/// *before* the items are laid out, because it is the space they are laid out into — so it cannot
+/// depend on the result of flexing, and §9.9.2 governs it.
+///
+/// For a **row** container the cross axis is the block axis, and the automatic block size of a
+/// block-level flex container is its content height. Nothing depends on it, so it is resolved
+/// *after* layout, from the flex lines' final cross sizes. For a multi-line row container §9.9.2
+/// itself defines the intrinsic cross size as the sum of the flex line cross sizes, and for a
+/// single-line container the line's cross size is by construction the largest item cross
+/// contribution — so the existing computation in `determine_container_cross_size` already
+/// coincides with §9.9.2 ([line cross sizes](https://www.w3.org/TR/css-flexbox-1/#algo-cross-line)).
+/// Row containers therefore need no change, and must not get this
+/// treatment: an item that grows from a zero flex base size contributes 0 pre-flex but a real
+/// height post-flex, and the post-flex answer is the correct one.
+fn determine_intrinsic_cross_size(
+    tree: &mut impl LayoutFlexboxContainer,
+    known_dimensions: Size<Option<f32>>,
+    available_space: Size<AvailableSpace>,
+    lines: &[FlexLine<'_>],
+    constants: &AlgoConstants,
+) -> Option<f32> {
+    let dir = constants.dir;
+
+    // Row containers are already conformant (see above), and a definite cross size wins outright.
+    if constants.is_row || known_dimensions.cross(dir).is_some() {
+        return None;
+    }
+
+    let cross_axis_gap = constants.gap.cross(dir);
+    let mut total = 0.0;
+
+    for line in lines.iter() {
+        let mut line_contribution: f32 = 0.0;
+
+        for item in line.items.iter() {
+            // The item's pre-flex main size: its flex base size, floored by its automatic minimum
+            // size and clamped by its main-axis min/max. The clamp happens *before* the ratio
+            // transfer below, so a main-axis minimum is reflected in the cross contribution.
+            let main_pb = (item.padding + item.border).main_axis_sum(dir);
+            // §9.9.2 asks for the item's max-content *contribution*, which is not the flex base
+            // size. `flex-basis` replaces the main size property for the purpose of flexing, but
+            // an item's max-content size still follows its own main size property: for
+            // `height: 50px; flex-basis: 80px` the contribution is 50 while the flex base size is
+            // 80, and the container must take the former. The two coincide whenever `flex-basis`
+            // is `auto`, which is why this distinction is invisible on most scenes.
+            //
+            // Spec: https://www.w3.org/TR/css-flexbox-1/#intrinsic-item-contributions
+            let pre_flex_main = item
+                .size
+                .main(dir)
+                .unwrap_or(item.flex_basis)
+                .maybe_clamp(item.min_size.main(dir), item.max_size.main(dir))
+                .max(item.resolved_minimum_main_size)
+                .max(main_pb);
+
+            let cross_pb = (item.padding + item.border).cross_axis_sum(dir);
+            let transferred_min_cross = item.min_size.maybe_apply_aspect_ratio(item.aspect_ratio).cross(dir);
+            let transferred_max_cross = item.max_size.maybe_apply_aspect_ratio(item.aspect_ratio).cross(dir);
+
+            // Only a *declared* cross size short-circuits. `item.size.cross` may instead hold a
+            // value transferred from the main size style through the aspect ratio, which is not
+            // the contribution we want: the contribution transfers from the flex base size, and
+            // the two differ whenever `flex-basis` differs from the main size property.
+            let declared_cross = item.size.cross(dir).filter(|_| !item.size_style.cross(dir).is_auto());
+
+            let inner_cross = if let Some(cross) = declared_cross {
+                cross
+            } else if let Some(ratio) = item
+                .aspect_ratio
+                // A cross size style that is a *sizing keyword* names the item's contribution
+                // directly, so it is measured under that keyword below rather than transferred
+                // through the ratio -- the item's own size may still come from the ratio and
+                // overflow the container. Only an `auto` cross size transfers here.
+                //
+                // Note this is `is_auto()` and not `is_none()`: the two differ exactly on sizing
+                // keywords. Collapse them and an item with `width: min-content` contributes a
+                // ratio-transferred size instead of its keyword-resolved one.
+                .filter(|_| item.size_style.cross(dir).is_auto())
+                // The container's contribution takes the item's *plain* intrinsic cross size, so
+                // the ratio transfers into it only when the item's main size is declared rather
+                // than derived from its own content. With a content-derived main size the
+                // transfer would feed the item's ratio-affected intrinsic size back into the
+                // container, and the container is precisely the thing that must not follow it.
+                .filter(|_| item.size.main(dir).is_some())
+            {
+                // Transferred through the aspect ratio from the pre-flex main size. Arithmetic
+                // only -- this branch performs no layout.
+                pre_flex_main * ratio
+            } else {
+                // A cross size that is a sizing keyword (`min-content`, `max-content`,
+                // `fit-content`, `fit-content(...)`) determines the available space constraint
+                // the item is measured under, as in `determine_hypothetical_cross_size`. Without
+                // this an item with `width: min-content` would contribute its *max*-content
+                // width, which is both wrong and larger.
+                let cross_stretch_size = constants
+                    .node_inner_size
+                    .cross(dir)
+                    .map(|val| constants.divided_cross_space(val))
+                    .maybe_sub(item.margin.cross_axis_sum(dir))
+                    .maybe_max(0.0);
+                let cross_available_space =
+                    match resolve_sizing_keyword(item.size_style.cross(dir), cross_stretch_size, cross_stretch_size) {
+                        Some(SizingKeywordResolution::Exact(size)) => AvailableSpace::Definite(size),
+                        Some(SizingKeywordResolution::Measure(available)) => available,
+                        None => available_space.cross(dir),
+                    };
+
+                // Measure the item on the cross axis with its flex base size as the main size.
+                // This is the same `measure_child_size` call `determine_container_main_size` makes
+                // for the other axis, from the same phase of the algorithm.
+                tree.measure_child_size(
+                    item.node,
+                    Size::NONE.with_main(dir, Some(pre_flex_main)),
+                    constants.node_inner_size,
+                    available_space
+                        .with_main(dir, AvailableSpace::Definite(pre_flex_main))
+                        .with_cross(dir, cross_available_space),
+                    SizingMode::ContentSize,
+                    dir.cross_axis(),
+                    Line::FALSE,
+                )
+            };
+
+            let outer_cross = inner_cross.maybe_clamp(transferred_min_cross, transferred_max_cross).max(cross_pb)
+                + item.margin.cross_axis_sum(dir);
+
+            line_contribution = f32_max(line_contribution, outer_cross);
+        }
+
+        total += line_contribution;
+    }
+
+    Some(total + sum_axis_gaps(cross_axis_gap, lines.len()))
 }
 
 /// Determine the container's main size (if not already known)
@@ -2369,9 +2541,14 @@ fn determine_container_cross_size(
     let cross_scrollbar_gutter = constants.scrollbar_gutter.cross(constants.dir);
     let min_cross_size = constants.min_size.cross(constants.dir);
     let max_cross_size = constants.max_size.cross(constants.dir);
+    // When the cross size is indefinite it is the container's *intrinsic* cross size (§9.9.2),
+    // computed pre-flex by `determine_intrinsic_cross_size`. That pass returns `None` wherever
+    // the existing sum-of-line-cross-sizes is already the right answer (row containers, and any
+    // container with a definite cross size), in which case this falls back to it unchanged.
+    let intrinsic_cross_size = constants.intrinsic_cross_size.unwrap_or(total_line_cross_size + total_cross_axis_gap);
     let outer_container_size = node_size
         .cross(constants.dir)
-        .unwrap_or(total_line_cross_size + total_cross_axis_gap + padding_border_sum)
+        .unwrap_or(intrinsic_cross_size + padding_border_sum)
         .maybe_clamp(min_cross_size, max_cross_size)
         .max(padding_border_sum - cross_scrollbar_gutter);
     let inner_container_size = f32_max(outer_container_size - padding_border_sum, 0.0);
