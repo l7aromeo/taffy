@@ -1347,12 +1347,33 @@ fn determine_flex_base_size(
         // Sizes transferred through the aspect ratio clamp the hypothetical main size,
         // but do not participate in resolving flexible lengths or clamping the final size.
         // https://github.com/w3c/csswg-drafts/issues/10997
+
+        // A minimum or maximum that reached the main axis *through the ratio* stops binding
+        // once the container determines the item's main size -- the cross size is clamped and
+        // the main size keeps what the container gave it. The container determines it when it
+        // has a definite main size *and* the item grows into it; without `flex-grow` the item
+        // owns its main size and the transferred clamp binds normally, which is what Chrome
+        // does.
+        //
+        // Only the ratio-derived part is suppressed, with the *declared* min/max as fallback:
+        // `maybe_apply_aspect_ratio` returns its input unchanged where there is no ratio, so
+        // `transferred_*` holds a transferred value in only one of its three cases despite the
+        // name, and suppressing it wholesale would disable ordinary clamping for items that
+        // never had a transfer.
+        //
+        // No spec sentence licenses this; it matches Chrome and Firefox, and the open question
+        // is the csswg issue above.
+        let main_is_determined = constants.has_definite_main_size && child.flex_grow > 0.0;
+        let (t_min_main, t_max_main) = if main_is_determined {
+            (child.min_size.main(constants.dir), child.max_size.main(constants.dir))
+        } else {
+            (transferred_min_size.main(constants.dir), transferred_max_size.main(constants.dir))
+        };
         let hypothetical_inner_min_main = child
             .resolved_minimum_main_size
-            .maybe_max(transferred_min_size.main(constants.dir))
+            .maybe_max(t_min_main)
             .maybe_max(padding_border_axes_sums.main(constants.dir));
-        let hypothetical_inner_size =
-            child.flex_basis.maybe_clamp(Some(hypothetical_inner_min_main), transferred_max_size.main(constants.dir));
+        let hypothetical_inner_size = child.flex_basis.maybe_clamp(Some(hypothetical_inner_min_main), t_max_main);
         let hypothetical_outer_size = hypothetical_inner_size + child.margin.main_axis_sum(constants.dir);
 
         child.hypothetical_inner_size.set_main(constants.dir, hypothetical_inner_size);
@@ -2440,9 +2461,44 @@ fn determine_hypothetical_cross_size(
         // main size through the aspect ratio, rather than keeping the value transferred from its
         // main size style before flexing. A declared cross size still wins.
         //
+        // Clamp-vs-ratio, stretch case. `align-self: stretch` determines the cross axis just as a
+        // binding clamp or `min == max` does, so when the main axis is *also* determined -- the
+        // container has a definite main size and the item grows into it -- the item's flexed
+        // main size is no longer transferred into its hypothetical cross size. Without that the
+        // transfer inflates the flex line, which the stretch then faithfully honours: the ratio
+        // wins by the back door. Only this direction is suppressed -- a cross size the container
+        // fixes still reaches the main axis through the ratio.
+        let stretched = !child.margin_is_auto.cross_start(constants.dir)
+            && !child.margin_is_auto.cross_end(constants.dir)
+            && (child.size_style.cross(constants.dir).is_stretch()
+                || (child.align_self == AlignSelf::STRETCH && child.size_style.cross(constants.dir).is_auto()));
+        // ...but only when the container's cross size is determined by something other than
+        // this item's own ratio, or "stretch to the line" resolves to a value the ratio itself
+        // produced. A non-wrapping column qualifies -- its cross size is the pre-flex
+        // contribution, fixed before any transfer. A row's cross axis comes from this item's
+        // own content and a wrapping column's depends on how the lines fall; neither is
+        // independent.
+        //
+        // Chrome, measured across four cases:
+        //
+        //   column, no wrap, indefinite cross    suppressed
+        //   column, wrap,    indefinite cross    not suppressed
+        //   row,    no wrap, indefinite cross    not suppressed
+        //   row,    no wrap, definite cross      suppressed, elsewhere in the algorithm
+        //
+        // **There is no spec text for this condition**: it is fitted to those measurements, not
+        // derived. This condition is false for the fourth case and a disjunct here for it would
+        // be dead code. The rule it must stay consistent with is the flex line's cross size.
+        // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
+        let main_to_cross_transfer_suppressed = stretched
+            && constants.has_definite_main_size
+            && child.flex_grow > 0.0
+            && !constants.is_row
+            && !constants.is_wrap;
 
         let transferred_cross_from_main = child
             .aspect_ratio
+            .filter(|_| !main_to_cross_transfer_suppressed)
             // A sizing keyword transfers here as well as `auto`. A box with a preferred aspect
             // ratio has *ratio-affected* intrinsic sizes: the min-content width of a ratio'd item
             // is its min-content height taken through the ratio, not the width its content would
