@@ -1021,6 +1021,98 @@ fn determine_flex_base_size(
                 )
                 .with_cross(dir, cross_axis_available_space);
 
+            // "If a cross size is needed to determine the main size (e.g. when the flex item's
+            //  main size is in its block axis) and the flex item's cross size is auto and not
+            //  definite, in this calculation use fit-content as the flex item's cross size."
+            //
+            // Spec: https://www.w3.org/TR/css-flexbox-1/#algo-main-item
+            //
+            // A cross size is needed to determine the main size exactly when the item has an
+            // aspect ratio and its main size is in its block axis -- i.e. a column container,
+            // since taffy is horizontal-writing-mode only. The item's fit-content cross size is
+            // its measured inline size, and the ratio transfers that into the main axis. The
+            // definite-cross case is handled by the branch above; this is the indefinite one.
+            if !dir.is_row() {
+                // The spec condition is that the cross size is "auto and not definite". A cross
+                // size style that is a *sizing keyword* (`min-content`, `fit-content`,
+                // `max-content`) is likewise not definite -- it names a measurement rather than a
+                // length -- and Chrome applies the ratio through it. So the test is that no exact
+                // cross size resolved, not that the style is literally `auto`.
+                //
+                // Definiteness: https://www.w3.org/TR/css-flexbox-1/#definite-sizes
+                //               https://www.w3.org/TR/css-sizing-3/#definite
+                if let Some(ratio) = child.aspect_ratio.filter(|_| child.size.cross(dir).is_none()) {
+                    // A cross size style that is a sizing keyword constrains this measurement:
+                    // `width: min-content` means the transfer starts from the item's min-content
+                    // width, not from an unconstrained one. Without this, wrappable content is
+                    // measured at its widest possible line and the main size transfers from a
+                    // width no layout will use.
+                    let keyword_cross = match resolve_sizing_keyword(
+                        child.size_style.cross(dir),
+                        cross_axis_available_space.into_option(),
+                        cross_axis_parent_size,
+                    ) {
+                        Some(SizingKeywordResolution::Exact(size)) => AvailableSpace::Definite(size),
+                        Some(SizingKeywordResolution::Measure(a)) => a,
+                        None => child_available_space.cross(dir),
+                    };
+                    let child_available_space = child_available_space.with_cross(dir, keyword_cross);
+
+                    debug_log!("COMPUTE CHILD BASE SIZE (fit-content cross through aspect ratio):");
+                    let fit_content_cross = tree.measure_child_size(
+                        child.node,
+                        child_known_dimensions,
+                        child_parent_size,
+                        child_available_space,
+                        SizingMode::ContentSize,
+                        dir.cross_axis(),
+                        Line::FALSE,
+                    );
+                    // css-sizing-4 §4.2: a size transferred through the ratio is "definite if
+                    // its input sizes are also definite", so percentages in the item's
+                    // descendants resolve against this main size.
+                    // <https://www.w3.org/TR/css-sizing-4/#aspect-ratio-automatic>
+                    //
+                    // What makes a content-derived block size indefinite is circularity, and it
+                    // does not arise here: this size follows from the item's *inline* size
+                    // through the ratio, without reference to its block-direction content.
+                    //
+                    // `constants.cross_axis_available_space_is_definite` is deliberately not
+                    // used -- it is a container-level fact, and the question here is per-item.
+                    // An item whose fit-content inline size is pinned by its own contents is
+                    // determinate whatever the container's available space is.
+                    //
+                    // Still an approximation: the strictly correct predicate is whether this
+                    // item's min-content and max-content inline sizes coincide, which needs a
+                    // second measurement. It errs in the direction Chrome errs.
+                    child.flex_basis_is_definite = true;
+                    // Clamp the cross size *before* transferring it. The item's own cross
+                    // minimum and maximum bind on the measured size, and the main size follows
+                    // from the clamped value -- an item with `max-width: 17px` and a 30-wide
+                    // measurement transfers from 17, not from 30. Transferring first and
+                    // clamping the result afterwards is a different (and wrong) operation,
+                    // because the clamp is on the cross axis.
+                    let clamped_cross =
+                        fit_content_cross.maybe_clamp(child.min_size.cross(dir), child.max_size.cross(dir));
+                    // A box with a preferred aspect ratio has ratio-affected intrinsic sizes,
+                    // so the transferred cross size cannot fall below the item's own
+                    // content-derived main size taken back through the ratio.
+                    //
+                    // Spec: https://www.w3.org/TR/css-sizing-4/#aspect-ratio-automatic
+                    let content_main = tree.measure_child_size(
+                        child.node,
+                        child_known_dimensions,
+                        child_parent_size,
+                        child_available_space,
+                        SizingMode::ContentSize,
+                        dir.main_axis(),
+                        Line::FALSE,
+                    );
+                    let clamped_cross = f32_max(clamped_cross, content_main * ratio);
+                    break 'flex_basis clamped_cross / ratio;
+                }
+            }
+
             debug_log!("COMPUTE CHILD BASE SIZE:");
             break 'flex_basis tree.measure_child_size(
                 child.node,
@@ -1062,18 +1154,71 @@ fn determine_flex_base_size(
 
         child.resolved_minimum_main_size = style_min_main_size.unwrap_or_else(|| {
             let min_content_main_size = {
-                let child_available_space = Size::MIN_CONTENT.with_cross(dir, cross_axis_available_space);
+                // The content size suggestion is measured with the item's own cross size in
+                // force. When that size is a sizing keyword it constrains the measurement, so
+                // wrappable content is measured at the width it will actually be laid out at.
+                let keyword_cross = match resolve_sizing_keyword(
+                    child.size_style.cross(dir),
+                    cross_axis_available_space.into_option(),
+                    cross_axis_parent_size,
+                ) {
+                    Some(SizingKeywordResolution::Exact(size)) => AvailableSpace::Definite(size),
+                    Some(SizingKeywordResolution::Measure(a)) => a,
+                    None => cross_axis_available_space,
+                };
+                let child_available_space = Size::MIN_CONTENT.with_cross(dir, keyword_cross);
 
-                debug_log!("COMPUTE CHILD MIN SIZE:");
-                tree.measure_child_size(
-                    child.node,
-                    child_known_dimensions,
-                    child_parent_size,
-                    child_available_space,
-                    SizingMode::ContentSize,
-                    dir.main_axis(),
-                    Line::FALSE,
-                )
+                // §4.5 builds the content-based minimum size from a *transferred size
+                // suggestion* as well as a content size suggestion: where the item has an aspect
+                // ratio, its main size follows from its cross size through that ratio. Measuring
+                // the main axis directly cannot produce it, because the measurement runs in
+                // `SizingMode::ContentSize`, which ignores the item's own size styles including
+                // the ratio -- so the ratio is silently dropped and the floor comes out as the
+                // raw content measurement.
+                //
+                // Spec: https://www.w3.org/TR/css-flexbox-1/#min-size-auto
+                //
+                // Measure the cross axis and transfer instead, on the same condition as the flex
+                // base size branch below: a column container (the item's main size is in its
+                // block axis) with no exact cross size resolved.
+                match child
+                    .aspect_ratio
+                    // A row container qualifies only when the item's cross size is definite. In a
+                    // column the cross is the inline axis and shrink-wraps to a determinate value
+                    // on its own; in a row it is the block axis, so there is nothing to transfer
+                    // from unless the container hands one down.
+                    .filter(|_| (!dir.is_row() || child_cross_size_is_definite) && child.size.cross(dir).is_none())
+                    // Only an `auto` cross size takes the transferred size suggestion. A sizing
+                    // keyword names the item's cross size directly, so its main size is measured
+                    // with that cross size in force (above) rather than transferred through the
+                    // ratio. `is_auto()`, not `is_none()`: the two differ exactly on keywords.
+                    .filter(|_| child.size_style.cross(dir).is_auto())
+                {
+                    Some(ratio) => {
+                        let cross = tree.measure_child_size(
+                            child.node,
+                            child_known_dimensions,
+                            child_parent_size,
+                            child_available_space,
+                            SizingMode::ContentSize,
+                            dir.cross_axis(),
+                            Line::FALSE,
+                        );
+                        cross / ratio
+                    }
+                    None => {
+                        debug_log!("COMPUTE CHILD MIN SIZE:");
+                        tree.measure_child_size(
+                            child.node,
+                            child_known_dimensions,
+                            child_parent_size,
+                            child_available_space,
+                            SizingMode::ContentSize,
+                            dir.main_axis(),
+                            Line::FALSE,
+                        )
+                    }
+                }
             };
 
             // 4.5. Automatic Minimum Size of Flex Items
@@ -1988,9 +2133,50 @@ fn determine_hypothetical_cross_size(
         let transferred_min_cross = child.min_size.maybe_apply_aspect_ratio(child.aspect_ratio).cross(constants.dir);
         let transferred_max_cross = child.max_size.maybe_apply_aspect_ratio(child.aspect_ratio).cross(constants.dir);
 
-        let child_cross = child
-            .size
-            .cross(constants.dir)
+        // An item whose cross size property is `auto` takes its cross size from its *flexed*
+        // main size through the aspect ratio, rather than keeping the value transferred from its
+        // main size style before flexing. A declared cross size still wins.
+        //
+
+        let transferred_cross_from_main = child
+            .aspect_ratio
+            // A sizing keyword transfers here as well as `auto`. A box with a preferred aspect
+            // ratio has *ratio-affected* intrinsic sizes: the min-content width of a ratio'd item
+            // is its min-content height taken through the ratio, not the width its content would
+            // occupy. This is the item's own used size.
+            //
+            // Spec: https://www.w3.org/TR/css-sizing-4/#aspect-ratio-automatic
+            //
+            // The container's contribution deliberately does NOT follow -- it takes the *plain*
+            // intrinsic size, which is why `determine_intrinsic_cross_size` keeps its `is_auto()`
+            // test. The two quantities differ, and an item wider than the container that sizes it
+            // is the correct result, not a bug.
+            .filter(|_| {
+                let cross_style = child.size_style.cross(constants.dir);
+                cross_style.is_auto() || cross_style.is_sizing_keyword()
+            })
+            .map(|ratio| {
+                // `aspect-ratio` relates the boxes named by `box-sizing`. Under `content-box` it
+                // relates the *content* boxes, so the item's main-axis padding and border come off
+                // before the transfer and its cross-axis padding and border go back on after it.
+                // The two sums differ, so this is not a no-op even for a square ratio: a 200-wide
+                // item with `padding: 10px 20px` transfers from 160 and lands at 180, not 200.
+                //
+                // This box-sizing handling comes from #1179 (mayakwd), which fixes the same
+                // transfer independently; the fixture that pins it was found by that PR's tests.
+                let box_sizing_adjustment =
+                    if tree.get_flexbox_child_style(child.node).box_sizing() == BoxSizing::ContentBox {
+                        (child.padding + child.border).sum_axes()
+                    } else {
+                        Size::ZERO
+                    };
+                let main = child.target_size.main(constants.dir) - box_sizing_adjustment.main(constants.dir);
+                let cross = if constants.is_row { main / ratio } else { main * ratio };
+                cross + box_sizing_adjustment.cross(constants.dir)
+            });
+
+        let child_cross = transferred_cross_from_main
+            .or(child.size.cross(constants.dir))
             .maybe_clamp(transferred_min_cross, transferred_max_cross)
             .maybe_max(padding_border_sum);
 
