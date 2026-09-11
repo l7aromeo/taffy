@@ -3,7 +3,8 @@ use crate::compute::common::alignment::{compute_alignment_offset, resolve_self_a
 use crate::geometry::{Line, Point, Rect, Size};
 use crate::style::{
     AlignContent, AlignContentKeyword, AlignItems, AlignItemsKeyword, AlignSelf, AvailableSpace, Contain,
-    JustifyContent, LengthPercentageAuto, Overflow, Position,
+    ExpandedLengthPercentage, ExpandedLengthPercentageAuto, JustifyContent, LengthPercentage, LengthPercentageAuto,
+    Overflow, Position,
 };
 use crate::style::{CoreStyle, FlexDirection, FlexboxContainerStyle, FlexboxItemStyle};
 use crate::style_helpers::{TaffyMaxContent, TaffyMinContent};
@@ -391,13 +392,14 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
     // If container size is undefined, determine the container's main size
     // and then re-resolve gaps based on newly determined size
     debug_log!("determine_container_main_size");
+    let container_main_was_indefinite = constants.node_inner_size.main(constants.dir).is_none();
     if let Some(inner_main_size) = constants.node_inner_size.main(constants.dir) {
         let outer_main_size = inner_main_size + constants.content_box_inset.main_axis_sum(constants.dir);
         constants.inner_container_size.set_main(constants.dir, inner_main_size);
         constants.container_size.set_main(constants.dir, outer_main_size);
     } else {
         // Sets constants.container_size and constants.outer_container_size
-        determine_container_main_size(tree, available_space, &mut flex_lines, &mut constants);
+        determine_container_main_size(tree, available_space, &mut flex_lines, &mut constants, true);
         constants.node_inner_size.set_main(constants.dir, Some(constants.inner_container_size.main(constants.dir)));
         constants.node_outer_size.set_main(constants.dir, Some(constants.container_size.main(constants.dir)));
 
@@ -415,6 +417,11 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
         constants.gap.set_main(constants.dir, new_gap);
     }
 
+    // The container's main size now exists, so items' percentage main-axis insets can be resolved
+    // against it. The container is not resized by the result.
+    debug_log!("reresolve_percentage_main_insets");
+    let main_insets_changed = reresolve_percentage_main_insets(tree, &mut flex_lines, &constants);
+
     // Determine the container's intrinsic cross size (§9.9.2). This must happen here, before
     // flexible lengths are resolved, because it is defined in terms of the items' *pre-flex*
     // contributions. It is consumed by `determine_container_cross_size` at step 15.
@@ -422,6 +429,58 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
     constants.intrinsic_cross_size =
         determine_intrinsic_cross_size(tree, known_dimensions, available_space, &flex_lines, &constants);
     debug_log!("constants.intrinsic_cross_size", dbg:constants.intrinsic_cross_size);
+
+    // The container's cross size now exists, so percentage cross values that collapsed at step 1
+    // can be resolved against it. The container is not resized by the result.
+    debug_log!("reresolve_percentage_cross_values");
+    let any_main_size_changed = reresolve_percentage_cross_values(tree, node, &mut flex_lines, &mut constants);
+
+    // Collect, resolve, re-collect.
+    //
+    // The re-resolution above can change an item's main size, and the lines were partitioned from
+    // the main sizes as they stood *before* it. Lines are a pure function of the items' final main
+    // sizes -- how a size was arrived at does not enter into the partition -- so collecting twice
+    // with different inputs is well defined and the second result is the one that counts.
+    //
+    // **If that invariant is ever false, this design is wrong.** The first collection exists only
+    // to give `determine_intrinsic_cross_size` a set of lines to sum over, which is the container's
+    // contribution computed with the percentage-dependent values absent -- the same quantity, and
+    // the same reasoning, that CSS uses to break the apparent circularity here.
+    //
+    // Costs one extra partition over already-computed sizes. No additional measurement.
+    if any_main_size_changed || main_insets_changed {
+        debug_log!("re-collect flex lines");
+        drop(flex_lines);
+        #[cfg(feature = "flexbox_balance")]
+        let recollected = if constants.is_balance {
+            collect_balanced_flex_lines(&constants, available_space, &mut flex_items)
+        } else {
+            collect_flex_lines(&constants, available_space, &mut flex_items)
+        };
+        #[cfg(not(feature = "flexbox_balance"))]
+        let recollected = collect_flex_lines(&constants, available_space, &mut flex_items);
+        flex_lines = recollected;
+
+        // The container's own main size was derived at step 4 from the same stale item main sizes.
+        // It is stale for exactly the same reason and has to follow -- this consumer runs *before*
+        // the correction rather than after it, which is why it is easy to miss.
+        //
+        // `consult_known_size: false` rather than blanking the recorded sizes first. This function
+        // writes its own result into `node_outer_size`, so a re-run that consulted it would read
+        // its own previous answer and return unchanged. Saying that in the signature is testable;
+        // clearing the state to trick the function into recomputing is not, and would break the
+        // next time someone adds a caller.
+        //
+        // Only the cross-derived corrections may resize the container. A percentage inset that
+        // has just resolved must NOT: the container's size was computed with it absent, which is
+        // the whole of how CSS breaks the circularity, and re-deriving it here would feed the
+        // item's new size straight back into the container it is supposed to overflow.
+        if container_main_was_indefinite && any_main_size_changed {
+            determine_container_main_size(tree, available_space, &mut flex_lines, &mut constants, false);
+            constants.node_inner_size.set_main(constants.dir, Some(constants.inner_container_size.main(constants.dir)));
+            constants.node_outer_size.set_main(constants.dir, Some(constants.container_size.main(constants.dir)));
+        }
+    }
 
     // 6. Resolve the flexible lengths of all the flex items to find their used main size.
     debug_log!("resolve_flexible_lengths");
@@ -800,6 +859,46 @@ fn determine_available_space(
     Size { width, height }
 }
 
+/// Whether any of an item's padding, border or margin needs the containing block's inline size to
+/// resolve. `calc()` counts: it may contain a percentage, and treating it as needing the basis is
+/// the conservative direction -- being wrong costs a cache miss, the other way costs a wrong size.
+///
+/// Padding and margin percentages both resolve against the *inline* size of the containing block,
+/// in both axes: [padding](https://www.w3.org/TR/css-box-3/#padding-physical),
+/// [margin](https://www.w3.org/TR/css-box-3/#margin-physical).
+///
+/// The padding and margin arms are covered by fixtures. **The border arm is not, and cannot be**:
+/// CSS [`border-width`](https://www.w3.org/TR/css-backgrounds-3/#the-border-width) accepts
+/// `<length> | thin | medium | thick` and no percentage, so a percentage
+/// border is an invalid declaration that no browser will evaluate and no browser-generated fixture
+/// can pin. taffy's own API does accept one -- the field is a `LengthPercentage` -- so the case is
+/// reachable through the Rust API with no ground truth available for it.
+///
+/// It is included rather than excluded for the same reason `calc()` is: a value that needs the
+/// basis and does not get it produces a silently wrong size, while a value that gets it and did not
+/// need it costs a cache miss. Do not read the suite passing as evidence about this arm.
+fn child_insets_need_inline_basis(style: &impl FlexboxItemStyle) -> bool {
+    // Both tests are written as *negative* matches: anything that is not a plain length -- and,
+    // for the `auto` form, not `auto` -- needs the basis. `Calc` is a `#[cfg(feature = "calc")]`
+    // variant, so naming it positively makes this fail to compile whenever that feature is off.
+    // The negative form covers `calc()` without naming it, and errs towards needing the basis if
+    // a variant is ever added, which is the safe direction: a value that needs the basis and does
+    // not get it is silently wrong, while one that gets it and did not need it costs a cache miss.
+    fn lp_needs_basis(v: LengthPercentage) -> bool {
+        !matches!(v.expand(), ExpandedLengthPercentage::Length(_))
+    }
+    fn lpa_needs_basis(v: LengthPercentageAuto) -> bool {
+        !matches!(v.expand(), ExpandedLengthPercentageAuto::Length(_) | ExpandedLengthPercentageAuto::Auto)
+    }
+    let padding = style.padding();
+    let border = style.border();
+    let margin = style.margin();
+    [padding.left, padding.right, padding.top, padding.bottom, border.left, border.right, border.top, border.bottom]
+        .into_iter()
+        .any(lp_needs_basis)
+        || [margin.left, margin.right, margin.top, margin.bottom].into_iter().any(lpa_needs_basis)
+}
+
 /// Determine the flex base size and hypothetical main size of each item.
 ///
 /// # [9.2. Line Length Determination](https://www.w3.org/TR/css-flexbox-1/#line-sizing)
@@ -841,7 +940,24 @@ fn determine_flex_base_size(
 
         // Parent size for child sizing
         let cross_axis_parent_size = constants.node_inner_size.cross(dir);
-        let child_parent_size = Size::from_cross(dir, cross_axis_parent_size);
+        // The main axis is normally withheld here, because a percentage *size* in an axis must not
+        // contribute to a min-content contribution in that same axis. But percentage *insets*
+        // resolve against the containing block's inline size and should still do so -- withholding
+        // the basis silently resolves them to zero.
+        //
+        // Spec: https://www.w3.org/TR/css-sizing-3/#min-percentage-contribution
+        //
+        // An item whose insets need the basis is given it. The rest keep the withheld form, because
+        // `parent_size` is part of the layout cache key: supplying a width where `None` used to be
+        // turns cache hits into misses for every node, including the great majority with no
+        // percentage anywhere. The test is on the *unresolved style* -- by the time `FlexItem`
+        // holds resolved values a percentage has already become a number and the information is
+        // gone.
+        let child_parent_size = if child_insets_need_inline_basis(&child_style) {
+            constants.node_inner_size
+        } else {
+            Size::from_cross(dir, cross_axis_parent_size)
+        };
 
         // Available space for child sizing
         // Min/max sizes transferred through the aspect ratio are taken into account here
@@ -1449,6 +1565,71 @@ fn item_known_dimension_definiteness(constants: &AlgoConstants, item: &FlexItem)
     Size { width: true, height: true }.with_main(dir, main_is_definite).with_cross(dir, cross_is_definite)
 }
 
+/// Re-resolve items' percentage main-axis insets once the container's main size is known.
+///
+/// An item's padding, border and margin resolve against the containing block's
+/// [inline size](https://www.w3.org/TR/css-box-3/#padding-physical). When
+/// the container's own main size is content-derived, that size does not exist while the items are
+/// being measured, so a percentage inset resolves to zero and the item's flex base size comes back
+/// without it. The container is then sized from those sizes -- correctly, because the contribution
+/// is supposed to exclude the percentage -- and the item is left one padding too small.
+///
+/// This adds the delta once the basis exists. The container is *not* resized by it: an item may
+/// end up wider than the container that sized it, which is what browsers do.
+///
+/// Returns whether any item's main size changed.
+fn reresolve_percentage_main_insets(
+    tree: &impl LayoutFlexboxContainer,
+    lines: &mut [FlexLine<'_>],
+    constants: &AlgoConstants,
+) -> bool {
+    let dir = constants.dir;
+    let Some(inner_main) = constants.node_inner_size.main(dir) else { return false };
+    let mut any_changed = false;
+
+    for line in lines.iter_mut() {
+        for item in line.items.iter_mut() {
+            let child_style = tree.get_flexbox_child_style(item.node);
+            if !child_insets_need_inline_basis(&child_style) {
+                continue;
+            }
+
+            // The inline size percentages resolve against. For a row container that is the main
+            // axis, which is the size that has just become available.
+            let basis = if dir.is_row() { Some(inner_main) } else { constants.node_inner_size.cross(dir) };
+            let Some(basis) = basis else { continue };
+
+            let padding = child_style.padding().resolve_or_zero(Some(basis), |v, b| tree.calc(v, b));
+            let border = child_style.border().resolve_or_zero(Some(basis), |v, b| tree.calc(v, b));
+            let margin = child_style.margin().resolve_or_zero(Some(basis), |v, b| tree.calc(v, b));
+
+            let old_main_inset = (item.padding + item.border).main_axis_sum(dir);
+            let new_main_inset = (padding + border).main_axis_sum(dir);
+            let delta = new_main_inset - old_main_inset;
+
+            item.padding = padding;
+            item.border = border;
+            item.margin = margin;
+
+            if delta != 0.0 {
+                item.flex_basis += delta;
+                item.inner_flex_basis = item.flex_basis - new_main_inset;
+                // The automatic minimum size is a content-based minimum and includes the item's
+                // own padding and border, so it moves by the same delta. Without this the item is
+                // free to shrink back to the size it had before the inset resolved, which is what
+                // `resolve_flexible_lengths` does as soon as the line overflows.
+                item.resolved_minimum_main_size += delta;
+                item.hypothetical_inner_size.set_main(dir, item.hypothetical_inner_size.main(dir) + delta);
+                item.hypothetical_outer_size
+                    .set_main(dir, item.hypothetical_inner_size.main(dir) + item.margin.main_axis_sum(dir));
+                any_changed = true;
+            }
+        }
+    }
+
+    any_changed
+}
+
 /// Determine the container's intrinsic cross size.
 ///
 /// # [9.9.2. Flex Container Intrinsic Cross Sizes](https://www.w3.org/TR/css-flexbox-1/#intrinsic-cross-sizes)
@@ -1602,17 +1783,139 @@ fn determine_intrinsic_cross_size(
     Some(total + sum_axis_gaps(cross_axis_gap, lines.len()))
 }
 
+/// Re-resolve the items' percentage cross-axis values once the container's cross size is known.
+///
+/// Items are generated at step 1, before the container's cross size exists, so a percentage cross
+/// size, minimum, maximum, margin or padding resolves against `None` and collapses. Writing the
+/// container's cross size back into `node_inner_size` is not enough on its own -- the only
+/// consumer has already run four steps earlier -- so the values have to be resolved again.
+///
+/// The apparent circularity (the container's size depends on the items, which depend on the
+/// container's size) is broken the way CSS breaks it: the container's cross size is computed with
+/// the percentage-dependent values treated as absent, the percentages are then resolved against
+/// that result, and **the container is not resized**. An item may overflow its container as a
+/// result, which is what Chrome does. See
+/// [§4.1 Percentage Sizing](https://www.w3.org/TR/css-sizing-3/#percentage-sizing) for the
+/// general form of this rule, and
+/// [§9.9.3](https://www.w3.org/TR/css-flexbox-1/#intrinsic-item-contributions) for the
+/// contribution the container is sized from.
+///
+/// Percentage cross *margins* fall out of the same rule: they resolve against the container's
+/// inline size, which for a column container is the cross axis, so nothing extra is needed for
+/// them.
+///
+/// Column containers only: for a row container the cross axis is the block axis, whose automatic
+/// size is resolved after layout, and percentages against it are indefinite by definition.
+fn reresolve_percentage_cross_values(
+    tree: &impl LayoutFlexboxContainer,
+    node: NodeId,
+    lines: &mut [FlexLine<'_>],
+    constants: &mut AlgoConstants,
+) -> bool {
+    let dir = constants.dir;
+    if constants.is_row {
+        return false;
+    }
+    let Some(inner_cross) = constants.intrinsic_cross_size else { return false };
+    let mut any_main_size_changed = false;
+
+    // The basis percentages now resolve against. The main axis keeps whatever definiteness it
+    // already had -- this pass only makes the cross axis available.
+    constants.node_inner_size.set_cross(dir, Some(inner_cross));
+    let percent_basis = constants.node_inner_size;
+
+    // The cross-axis gap is a percentage of the same basis. This is done here rather than
+    // alongside the main-axis gap re-resolution after `determine_container_main_size`, because it
+    // depends on the cross size this pass has just made available and that one does not.
+    let container_style = tree.get_flexbox_container_style(node);
+    if let Some(gap) = container_style.gap().cross(dir).maybe_resolve(inner_cross, |v, b| tree.calc(v, b)) {
+        constants.gap.set_cross(dir, gap);
+    }
+    drop(container_style);
+
+    for line in lines.iter_mut() {
+        for item in line.items.iter_mut() {
+            let child_style = tree.get_flexbox_child_style(item.node);
+
+            let padding = child_style.padding().resolve_or_zero(Some(inner_cross), |v, b| tree.calc(v, b));
+            let border = child_style.border().resolve_or_zero(Some(inner_cross), |v, b| tree.calc(v, b));
+            let box_sizing_adjustment = if child_style.box_sizing() == BoxSizing::ContentBox {
+                (padding + border).sum_axes()
+            } else {
+                Size::ZERO
+            };
+
+            let size = child_style
+                .size()
+                .maybe_resolve(percent_basis, |v, b| tree.calc(v, b))
+                .maybe_apply_aspect_ratio(item.aspect_ratio)
+                .maybe_add(box_sizing_adjustment);
+            let min_size = child_style
+                .min_size()
+                .maybe_resolve(percent_basis, |v, b| tree.calc(v, b))
+                .maybe_add(box_sizing_adjustment);
+            let max_size = child_style
+                .max_size()
+                .maybe_resolve(percent_basis, |v, b| tree.calc(v, b))
+                .maybe_add(box_sizing_adjustment);
+
+            // Only the cross components are replaced. The main components were resolved against
+            // the main size, which this pass does not change.
+            let previous_cross = item.size.cross(dir);
+            item.size.set_cross(dir, size.cross(dir));
+            item.min_size.set_cross(dir, min_size.cross(dir));
+            item.max_size.set_cross(dir, max_size.cross(dir));
+
+            item.margin = child_style.margin().resolve_or_zero(Some(inner_cross), |v, b| tree.calc(v, b));
+            item.padding = padding;
+            item.border = border;
+
+            // One ordered derivation, not three corrections: the cross size has just been
+            // resolved, the flex base size follows from it through the ratio, and the automatic
+            // minimum size follows from the base size. Correcting these separately afterwards
+            // leaves each one computed from a stale input.
+            //
+            // Only items whose cross size was previously unresolved are touched, and only when
+            // `flex-basis` is `auto`: a declared flex basis is not derived from anything and must
+            // not be overwritten.
+            let cross_became_resolved = previous_cross.is_none() && item.size.cross(dir).is_some();
+            if cross_became_resolved && child_style.flex_basis().is_auto() {
+                if let (Some(ratio), Some(cross)) = (item.aspect_ratio, item.size.cross(dir)) {
+                    let main_pb = (item.padding + item.border).main_axis_sum(dir);
+                    let basis = (if dir.is_row() { cross * ratio } else { cross / ratio }).max(main_pb);
+                    item.flex_basis = basis;
+                    item.inner_flex_basis = basis - main_pb;
+                    // The floor was derived from the stale cross and can only be too large.
+                    item.resolved_minimum_main_size = item.resolved_minimum_main_size.min(basis);
+                    item.hypothetical_inner_size.set_main(dir, basis);
+                    item.hypothetical_outer_size.set_main(dir, basis + item.margin.main_axis_sum(dir));
+                    any_main_size_changed = true;
+                }
+            }
+        }
+    }
+
+    any_main_size_changed
+}
+
 /// Determine the container's main size (if not already known)
+/// `consult_known_size` says whether a main size already recorded on the node may be used in place
+/// of computing one. It is `true` on the first call, where a known outer main size is the answer.
+/// It is `false` when re-running after the items' main sizes have been corrected: this function
+/// writes its own result back into `node_outer_size`, so a second call that consulted it would read
+/// its own previous answer and return it unchanged.
 fn determine_container_main_size(
     tree: &mut impl LayoutFlexboxContainer,
     available_space: Size<AvailableSpace>,
     lines: &mut [FlexLine<'_>],
     constants: &mut AlgoConstants,
+    consult_known_size: bool,
 ) {
     let dir = constants.dir;
     let main_content_box_inset = constants.content_box_inset.main_axis_sum(constants.dir);
 
-    let outer_main_size: f32 = constants.node_outer_size.main(constants.dir).unwrap_or_else(|| {
+    let known_outer_main_size = if consult_known_size { constants.node_outer_size.main(constants.dir) } else { None };
+    let outer_main_size: f32 = known_outer_main_size.unwrap_or_else(|| {
         match available_space.main(dir) {
             AvailableSpace::Definite(main_axis_available_space) => {
                 let main_axis_gap = constants.gap.main(constants.dir);
